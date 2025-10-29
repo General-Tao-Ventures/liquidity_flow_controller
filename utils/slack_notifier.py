@@ -1,5 +1,6 @@
 # Enhanced SlackNotifier with separate channels, daily summaries, and error categorization
 import json
+import os
 import socket
 import requests
 import threading
@@ -37,16 +38,11 @@ class SlackNotifier:
         self.lifetime_metrics = self._load_lifetime_metrics()
 
         # Daily metrics (reset each day)
+        self.daily_metrics_date = datetime.now(timezone.utc).strftime("%Y-%m-%d")
         if self.is_miner:
-            # Stake sweeper metrics
-            self.daily_metrics = {
-                "stake_sweeps_count": 0,
-                "stake_sweeps_failed": 0,
-                "stake_transfers_count": 0,
-                "stake_transfers_failed": 0,
-                "total_stake_swept": 0.0,  # in TAO
-                "total_stake_transferred": 0.0,  # in TAO
-            }
+            self.daily_metrics_file = f"{self.node_type.lower()}_daily_metrics.json"
+            self.daily_metrics = self._default_daily_metrics()
+            self._load_daily_metrics_persistent()
         else:
             # Validator-specific metrics
             self.daily_metrics = {
@@ -60,6 +56,55 @@ class SlackNotifier:
 
         # Start daily summary thread
         self._start_daily_summary_thread()
+
+    def _default_daily_metrics(self) -> Dict[str, Any]:
+        if self.is_miner:
+            return {
+                "stake_sweeps_count": 0,
+                "stake_sweeps_failed": 0,
+                "stake_transfers_count": 0,
+                "stake_transfers_failed": 0,
+                "total_stake_swept": 0.0,
+                "total_stake_transferred": 0.0,
+            }
+        return {}
+
+    def _load_daily_metrics_persistent(self) -> None:
+        if not self.is_miner:
+            return
+        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        self.daily_metrics_date = today
+        try:
+            if os.path.exists(self.daily_metrics_file):
+                with open(self.daily_metrics_file, "r", encoding="utf-8") as handle:
+                    data = json.load(handle)
+                if data.get("date") == today:
+                    stored = data.get("metrics", {})
+                    merged = self._default_daily_metrics()
+                    merged.update(stored)
+                    self.daily_metrics = merged
+                else:
+                    # Different day; overwrite with defaults
+                    self.daily_metrics = self._default_daily_metrics()
+                    self._save_daily_metrics_persistent()
+            else:
+                self._save_daily_metrics_persistent()
+        except Exception as exc:  # pylint: disable=broad-except
+            bt.logging.warning(f"Failed to load daily metrics: {exc}")
+            self.daily_metrics = self._default_daily_metrics()
+
+    def _save_daily_metrics_persistent(self) -> None:
+        if not self.is_miner:
+            return
+        try:
+            payload = {
+                "date": self.daily_metrics_date,
+                "metrics": self.daily_metrics,
+            }
+            with open(self.daily_metrics_file, "w", encoding="utf-8") as handle:
+                json.dump(payload, handle)
+        except Exception as exc:  # pylint: disable=broad-except
+            bt.logging.warning(f"Failed to save daily metrics: {exc}")
 
     def _get_vm_ip(self) -> str:
         """Get the VM's IP address"""
@@ -402,14 +447,9 @@ class SlackNotifier:
                 self.lifetime_metrics["total_lifetime_stake_transferred"] += self.daily_metrics["total_stake_transferred"]
 
                 # Reset daily metrics after successful send
-                self.daily_metrics = {
-                    "stake_sweeps_count": 0,
-                    "stake_sweeps_failed": 0,
-                    "stake_transfers_count": 0,
-                    "stake_transfers_failed": 0,
-                    "total_stake_swept": 0.0,
-                    "total_stake_transferred": 0.0,
-                }
+                self.daily_metrics = self._default_daily_metrics()
+                self.daily_metrics_date = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+                self._save_daily_metrics_persistent()
 
             except Exception as e:
                 bt.logging.error(f"Failed to send daily summary: {e}")
@@ -664,12 +704,14 @@ class SlackNotifier:
             with self.daily_summary_lock:
                 self.daily_metrics["stake_sweeps_count"] += 1
                 self.daily_metrics["total_stake_swept"] += amount_tao
+                self._save_daily_metrics_persistent()
 
     def record_stake_sweep_failure(self):
         """Record a failed stake sweep for miners"""
         if self.is_miner:
             with self.daily_summary_lock:
                 self.daily_metrics["stake_sweeps_failed"] += 1
+                self._save_daily_metrics_persistent()
 
     def record_stake_transfer_success(self, amount_tao: float):
         """Record a successful stake transfer for miners"""
@@ -677,12 +719,14 @@ class SlackNotifier:
             with self.daily_summary_lock:
                 self.daily_metrics["stake_transfers_count"] += 1
                 self.daily_metrics["total_stake_transferred"] += amount_tao
+                self._save_daily_metrics_persistent()
 
     def record_stake_transfer_failure(self):
         """Record a failed stake transfer for miners"""
         if self.is_miner:
             with self.daily_summary_lock:
                 self.daily_metrics["stake_transfers_failed"] += 1
+                self._save_daily_metrics_persistent()
 
     def shutdown(self):
         """Clean shutdown - save metrics"""

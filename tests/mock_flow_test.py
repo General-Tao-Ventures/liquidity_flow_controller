@@ -231,10 +231,51 @@ class FakeEvent:
         self._set = True
 
     def wait(self, interval: float) -> bool:
-        self.wait_calls += 1
-        if self.wait_calls >= 1:
-            self._set = True
-        return True
+       self.wait_calls += 1
+       if self.wait_calls >= 1:
+           self._set = True
+       return True
+
+
+class FakeSlackNotifier:
+    """Test double that captures Slack notifications without network traffic."""
+
+    instances: list["FakeSlackNotifier"] = []
+
+    def __init__(self, hotkey, webhook_url=None, error_webhook_url=None, is_miner=False):
+        self.hotkey = hotkey
+        self.webhook_url = webhook_url
+        self.error_webhook_url = error_webhook_url or webhook_url
+        self.is_miner = is_miner
+        self.messages: list[tuple[str, str]] = []
+        self.sweep_success: list[float] = []
+        self.sweep_failures = 0
+        self.transfer_success: list[float] = []
+        self.transfer_failures = 0
+        self.shutdown_called = False
+        FakeSlackNotifier.instances.append(self)
+
+    @classmethod
+    def reset(cls):
+        cls.instances.clear()
+
+    def send_message(self, message: str, level: str = "info"):
+        self.messages.append((level, message))
+
+    def record_stake_sweep_success(self, amount_tao: float):
+        self.sweep_success.append(amount_tao)
+
+    def record_stake_sweep_failure(self):
+        self.sweep_failures += 1
+
+    def record_stake_transfer_success(self, amount_tao: float):
+        self.transfer_success.append(amount_tao)
+
+    def record_stake_transfer_failure(self):
+        self.transfer_failures += 1
+
+    def shutdown(self):
+        self.shutdown_called = True
 
 
 class MockFlowTest(unittest.TestCase):
@@ -279,6 +320,7 @@ class MockFlowTest(unittest.TestCase):
             logging=SimpleNamespace(
                 debug=True, trace=False, info=False, record_log=False, logging_dir="~/.bittensor/miners"
             ),
+            slack_webhook_url="https://hooks.slack.test/mock",
         )
 
         cold_env = f"BT_PW_{miner_config.wallet.name.upper()}_COLD"
@@ -286,11 +328,13 @@ class MockFlowTest(unittest.TestCase):
         os.environ.pop(cold_env, None)
         os.environ.pop(hot_env, None)
 
+        FakeSlackNotifier.reset()
         with patch.object(miner.bt, "subtensor", factory), patch.object(miner.bt, "wallet", fake_bt_wallet):
             with patch.object(miner, "stop_event", fake_event), patch("neuron.miner.signal.signal"):
                 with patch.object(miner, "parse_miner_config", return_value=miner_config):
                     with patch("neuron.miner.load_wallet_password_from_env", return_value="mockpass"):
-                        miner.main()
+                        with patch("neuron.miner.SlackNotifier", FakeSlackNotifier):
+                            miner.main()
 
         cold_cached = os.environ.get(cold_env)
         hot_cached = os.environ.get(hot_env)
@@ -314,6 +358,33 @@ class MockFlowTest(unittest.TestCase):
             0,
             "Aggregator stake should be emptied after transfer in the mock flow.",
         )
+
+        # Validate Slack notifier interactions
+        self.assertEqual(len(FakeSlackNotifier.instances), 1, "Miner should create a Slack notifier instance.")
+        notifier = FakeSlackNotifier.instances[0]
+        self.assertTrue(
+            notifier.is_miner,
+            "Slack notifier should be configured for miner mode.",
+        )
+        self.assertTrue(
+            any(level == "info" and "Miner started" in message for level, message in notifier.messages),
+            "Startup notification should be sent.",
+        )
+        self.assertTrue(
+            notifier.shutdown_called,
+            "Shutdown should trigger notifier cleanup.",
+        )
+        self.assertGreater(
+            len(notifier.sweep_success),
+            0,
+            "Successful stake sweeps should be recorded.",
+        )
+        self.assertGreater(
+            len(notifier.transfer_success),
+            0,
+            "Successful stake transfers should be recorded.",
+        )
+
         miner._clear_password_env_vars()
         self.assertIsNone(os.environ.get(cold_env))
         self.assertIsNone(os.environ.get(hot_env))
